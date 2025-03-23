@@ -1,0 +1,1469 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>🪷</title>
+<link rel=icon href='data:image/svg+xml,
+    <svg xmlns=%22http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+    <text y="1.1em" font-size="75">🪷</text></svg>'>
+</head>
+<body style="margin: 0; background-color: #222">
+<canvas id="gl_canvas" style="position: absolute"></canvas>
+<canvas id="2d_canvas" style="position: absolute"></canvas>
+
+<script id="main">
+const grid_size = 256
+
+onload = function() {
+    load_webgl()
+    loop()
+}
+
+function loop() {
+    fix_size()
+    update_timing()
+    update_cam()
+
+    if (mouse_held(0)) interact()
+    const t = timing
+    if (!t.paused) {
+        for (let i=0; i < t.steps_per_frame; i++)
+        { sim_step() }
+    }
+    draw()
+    if (show_debug) draw_debug()
+
+    mouse.px = mouse.x
+    mouse.py = mouse.y
+
+    t.frame++
+    requestAnimationFrame(loop)
+}
+</script>
+
+
+<script id="math">
+const floor = Math.floor
+const round = Math.round
+const sqrt = Math.sqrt
+const log2 = Math.log2
+const log = Math.log
+const exp = Math.exp
+const pow = Math.pow
+const abs = Math.abs
+const min = Math.min
+const max = Math.max
+const sin = Math.sin
+const cos = Math.cos
+
+const pi = Math.PI
+const tau = 2 * pi
+
+const rand = Math.random
+function randn(mean=0, std=1, std_clip) {
+    // box-muller transform
+    // if std_clip given, and outside +/- mean * std * std_clip,
+    // then we uniformly resample to that
+    // (1 - rand() is to avoid log(0))
+    const z = sqrt(-2 * log(1 - rand())) * cos(tau * rand())
+    const x = mean + std * z
+    if (std_clip === undefined) return x
+
+    const clip = std * std_clip
+    if (x >= -clip && x < clip) return x
+    return mean - clip + rand() * 2 * clip
+}
+
+function clamp(x, a, b) {
+    return min(max(x, a), b)
+}
+function lerp(a, b, t) {
+    return a * (1 - t) + b * t
+}
+function inv_lerp(a, b, x) {
+    if (b - a === 0) return 0 
+    return (x - a) / (b - a)
+}
+function clamped_lerp(a, b, t, f) {
+    // lerp from a, but dont change more than by a factor of f (> 1)
+    return clamp(lerp(a, b, t), a / f, a * f)
+}
+function mod(x, n) {
+    return ((x % n) + n) % n
+}
+</script>
+
+
+<script id="timing">
+const now = () => performance.now()
+const timing = {
+    paused: false,
+    zero: now(),
+    sec: 0,
+    frame: 0,
+    step: 0,
+    last_frame_start: -16,
+    fps: 60,
+    fps_slow: 60,
+    fps_everysec: 60,
+    fps_hist: [],
+
+    base_steps_per_frame: 10,
+    adaptive: true,
+    steps_per_frame: 10,
+    spf_everysec: 10,
+    spf_hist: [],
+    spf_accel: 0.002,
+    fourier_hist: [],
+}
+
+setInterval(() => {
+    const t = timing
+    t.fps_everysec = t.fps
+    t.spf_everysec = t.steps_per_frame
+}, 1000)
+
+function update_timing() {
+    const frame_start = now()
+    const t = timing
+    t.sec = (frame_start - t.zero) / 1000
+
+    // update fps
+    const last_fps = 1000 / (frame_start - t.last_frame_start)
+    t.last_frame_start = frame_start
+    t.fps = clamped_lerp(t.fps, last_fps, 0.5, 1.2)
+    t.fps_slow = clamped_lerp(t.fps_slow, t.fps, 0.02, 1.2)
+    t.fps_hist.push(t.fps)
+    if (t.fps_hist.length > 400) t.fps_hist.shift()
+    // cyclic fps history for debug view
+    const a = t.frame / 60 * tau
+    t.fourier_hist.push([t.fps * cos(a), t.fps * sin(a)])
+    if (t.fourier_hist.length > 100) t.fourier_hist.shift()
+
+    // update steps/frame
+    if (t.adaptive && !t.paused) {
+        // increase while slow/fast fps moving averages agree
+        // decrease if they differ more than 10%
+        const err = 1 - min(t.fps / t.fps_slow, t.fps_slow / t.fps)
+        // increase spf acceleration while err < 10%
+        t.spf_accel = lerp(
+            t.spf_accel,
+            max(0.10 - err, 0) * 0.02,
+            0.01,
+        )
+        t.base_steps_per_frame = max(t.base_steps_per_frame * exp(
+            t.spf_accel
+            // 10x stronger proportional decrease while err > 10%
+            + min(0.10 - err, 0) * 0.2
+        ), 1)
+
+        // scale spf with a wave, peaking every 60 frames
+        // (to make occasional detectable frame time increases)
+        t.steps_per_frame = max(t.base_steps_per_frame * exp(
+            0.15 * sin(t.frame / 60 * tau)
+        ), 1)
+    } else {
+        t.steps_per_frame = t.base_steps_per_frame
+    }
+    t.spf_hist.push(t.steps_per_frame)
+    if (t.spf_hist.length > 400) t.spf_hist.shift()
+}
+</script>
+
+
+<script id="controls">
+let show_ew = false
+let solid_colors = false
+let show_debug = false
+
+const brush = {
+    get_size: () => 0.05 / zoom.scale,
+    erase: false,
+}
+
+const mouse = {
+    x: 0, y: 0,
+    px: 0, py: 0,
+    held: { 0: false, 1: false, 2: false },
+}
+
+function mouse_held(button) {
+    if (button === undefined) {
+        for (const b in mouse.held) {
+            if (mouse.held[b]) {
+                return true
+            }
+        }
+        return false
+    }
+    return button in mouse.held && mouse.held[button]
+}
+
+onmousemove = e => {
+    mouse.x = e.x
+    mouse.y = e.y
+}
+onwheel = e => {
+    zoom.vel_factor -= e.deltaY / 2000   
+}
+oncontextmenu = e => e.preventDefault()
+onmousedown = e => {
+    if (e.button in mouse.held) {
+        mouse.held[e.button] = true
+    }
+    if (e.button === 2) {
+        pan.held = true
+    }
+}
+onmouseup = e => {
+    if (e.button in mouse.held) {
+        mouse.held[e.button] = false
+    }
+    if (e.button === 2) {
+        pan.held = false
+    }
+}
+onmouseleave = e => {
+    pan.held = false
+}
+
+onkeydown = e => {
+    const t = timing
+    switch (e.key) {
+        case " ": t.paused = !t.paused; break
+        case "ArrowRight": sim_step(); break
+        case "w": show_ew = !show_ew; break
+        case "s": solid_colors = !solid_colors; break
+        case "e": brush.erase = true; break
+        case "d":
+            show_debug = !show_debug
+            ctx.clearRect(
+                0, 0, canvases.ctx.width, canvases.ctx.height
+            )
+            break
+        case "r":
+            init_cells(grid_cells[0], grid_size)
+            break
+    }
+}
+onkeyup = e => {
+    switch (e.key) {
+        case "e": brush.erase = false; break
+    }
+}
+</script>
+
+
+<script id="camera">
+const pan = {
+    x: 0, y: 0,
+    xv: 0, yv: 0,
+    held: false,
+}
+const zoom = {
+    scale: 1,
+    min_scale: 1,
+    max_scale: grid_size / 4,
+    vel_factor: 1,
+}
+
+function update_cam() {
+    // zoom
+    const pscale1 = zoom.scale
+    zoom.vel_factor = clamp(zoom.vel_factor, 0.5, 2.0)
+    zoom.scale *= zoom.vel_factor
+    const pscale2 = zoom.scale
+    // elastic bounds
+    const log_zoom = log2(zoom.scale)
+    const log_min = log2(zoom.min_scale)
+    const log_max = log2(zoom.max_scale)
+    const log_target = log_zoom < log_min ? log_min : (
+        log_zoom > log_max ? log_max : log_zoom
+    )
+    const bounce_factor = 1 - pow(
+        1.7,
+        -pow(abs(log_zoom - log_target) * 0.5, 0.5),
+    )
+    zoom.scale = pow(2, lerp(log_zoom, log_target, bounce_factor))
+    zoom.vel_factor = lerp(
+        zoom.vel_factor, 1, 0.2 * pow(3, -bounce_factor * 2)
+    )
+
+    // update pan to keep mouse in place
+    // (or more slidey for elastic scaling)
+    const short_edge = min(innerWidth, innerHeight)
+    const mouse_uv = [
+        (mouse.x - innerWidth / 2) / short_edge,
+        (mouse.y - innerHeight / 2) / short_edge,
+    ]
+    const pan_factor = 1 / pscale1 - 1 / zoom.scale
+
+    if (zoom.scale > zoom.min_scale && zoom.scale < zoom.max_scale) {
+        pan.x -= mouse_uv[0] * pan_factor
+        pan.y -= mouse_uv[1] * pan_factor
+    } else if (
+        zoom.scale < zoom.min_scale && pan_factor <= 0
+        || zoom.scale > zoom.min_scale && pan_factor >= 0
+    ) {
+        const pan_factor_scroll = 1 / pscale1 - 1 / pscale2
+        const a = 0.2
+        // it just works tm
+        const f = pan_factor + a * exp(
+            (pan_factor_scroll - pan_factor) / a
+        ) - a
+        const cur_d = pow(pan.xv, 2) + pow(pan.yv, 2)
+        const prop_d = (
+            pow(mouse_uv[0] * f, 2)
+            + pow(mouse_uv[1] * f, 2)
+        )
+        if (prop_d > cur_d) {
+            pan.xv = -mouse_uv[0] * f
+            pan.yv = -mouse_uv[1] * f
+        }
+    }
+
+    // pan
+    // todo: framerate independence, mouse velocity smoothing
+    if (pan.held) {
+        const dx = (mouse.x - mouse.px) / zoom.scale / short_edge
+        const dy = (mouse.y - mouse.py) / zoom.scale / short_edge
+        pan.xv = dx
+        pan.yv = dy
+        pan.x += dx
+        pan.y += dy
+    } else {
+        pan.x += pan.xv
+        pan.y += pan.yv
+        pan.xv *= 0.9
+        pan.yv *= 0.9
+    }
+}
+</script>
+
+
+<script id="debug">
+function draw_debug() {
+    // clear
+    const [w, h] = [canvases.ctx.width, canvases.ctx.height]
+    ctx.clearRect(0, 0, w, h)
+    const t = timing
+
+    // bg
+    ctx.fillStyle = "rgba(0 0 0 / 50%)"
+    ctx.fillRect(0, 0, 600, 200)
+
+    // lines
+    ctx.lineCap = "round"
+    ctx.lineWidth = 3
+    // fps
+    ctx.strokeStyle = "lightgreen"
+    ctx.beginPath()
+    for (let i=0; i < t.fps_hist.length; i++) {
+        const y = 200 - t.fps_hist[i] * 0.8
+        if (i > 0) ctx.lineTo(i, y)
+        ctx.moveTo(i, y)
+    }
+    ctx.stroke()
+    // spf
+    ctx.strokeStyle = "lightblue"
+    ctx.beginPath()
+    for (let i=0; i < t.spf_hist.length; i++) {
+        const y = 200 - t.spf_hist[i] / 10
+        if (i > 0) ctx.lineTo(i, y)
+        ctx.moveTo(i, y)
+    }
+    ctx.stroke()
+
+    // slow fps circle
+    ctx.strokeStyle = "white"
+    ctx.fillStyle = "green"
+    ctx.beginPath()
+    const fps_slow_y = 200 - t.fps_slow * 0.8
+    ctx.arc(t.fps_hist.length, fps_slow_y, 3, 0, tau)
+    ctx.stroke()
+    ctx.fill()
+
+    // fps fourier cycles
+    ctx.globalAlpha = 0.2
+    ctx.strokeStyle = "lightgreen"
+    const [cx, cy] = [500, 120]
+    ctx.beginPath()
+    for (let i=0; i < t.fourier_hist.length; i++) {
+        const [fx, fy] = t.fourier_hist[i]
+        const x = cx + fx * 0.8
+        const y = cy + fy * 0.8
+        if (i === 0) {
+            ctx.moveTo(x, y)
+            continue
+        }
+        ctx.lineTo(x, y)
+        ctx.stroke()
+        ctx.beginPath()
+        ctx.moveTo(x, y)
+    }
+    ctx.globalAlpha = 1
+
+    // text
+    ctx.font = "32px Courier New"
+    ctx.textBaseline = "top"
+    // fps
+    ctx.fillStyle = "lightgreen"
+    ctx.fillText(`fps: ${round(t.fps_everysec)}`, 10, 10)
+    // spf
+    ctx.fillStyle = "lightblue"
+    ctx.fillText(`steps/frame: ${round(t.spf_everysec)}`, 180, 10)
+}
+</script>
+
+
+<script type="x-shader/x-vertex" id="vert">
+#version 300 es
+in vec2 pos;
+out vec2 uv;
+
+void main() {
+    gl_Position = vec4(pos, 0, 1);
+    uv = pos * 0.5 + 0.5;
+    uv.y = 1.0 - uv.y;
+}
+</script>
+
+
+<script type="x-shader/x-fragment" id="frag_sim">
+#version 300 es
+precision highp float;
+precision highp int;
+precision highp usampler2D;
+
+out uvec4 cell;
+
+uniform usampler2D cells;
+uniform int time_step;
+uniform float time_sec;
+uniform bool solid_colors;
+
+/*<snip_ew_sim>*/
+
+/*
+cell format (left to right):
+r: {8b red color}, {8b green}, {8b blue}, {8b alpha}
+g: {8b element type}, {24b elem data}
+b: {32b elem data}
+a: {3b unused}, {14b event count/sec moving average},
+    {14b event center count}, {1b time second % 2}
+*/
+
+const uint type_none = 0u;  // out of bounds
+const uint type_air = 1u;
+const uint type_pink_sand = 2u;
+const uint type_worm = 3u;
+
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec2 res = textureSize(cells, 0);
+    cell = texelFetch(cells, p, 0);
+    ivec4 ew_coords = get_ew_coords(p);
+    int id = ew_coords.w;
+    ivec2 center = p - ew_coords.xy;
+
+    // event rate tracking
+    uint sec_phase = uint(time_sec) & 1u;
+    uint count = get_bits(cell.a, 14, 1);
+    if (sec_phase != (cell.a & 1u)) {
+        // update avg
+        uint avg = get_bits(cell.a, 14, 15);
+        avg = (avg + count) / 2u;
+        cell.a = set_bits(cell.a, 14, 15, avg);
+        // zero out count and set phase
+        cell.a = set_bits(cell.a, 15, 0, sec_phase);
+    }
+    if (id == 0) {
+        // increment count
+        cell.a = set_bits(cell.a, 14, 1, count + 1u);
+    }
+
+    // skip if cell outside window or window center outside world
+    if (
+        ew_coords.z > 4 || min(center.x, center.y) < 0
+        || center.x >= res.x || center.y >= res.y
+    ) { return; }
+
+    // common vars
+    uvec4 center_cell = texelFetch(cells, center, 0);
+    uint center_type = get_cell_type(center, 0);
+    uvec3 urng = uhash(ivec3(center, time_step));
+    vec3 rng = vec3(urng) * (1.0 / float(~0u));
+    int swap_with = 0;
+
+    // update according to center
+    switch (center_type) {
+    case type_air:
+        swap_with = int(rng.r * 5.0);
+        if (get_cell_type(center, swap_with) != type_air) break;
+        if (id == swap_with) {
+            cell.rgb = center_cell.rgb;
+        } else if (id == 0) {
+            ivec2 sp = center + ew_id_to_xy(swap_with);
+            cell.rgb = texelFetch(cells, sp, 0).rgb;
+        }
+        break;
+
+    case type_pink_sand:
+        // https://www.todepond.com
+        if (get_cell_type(center, 3) == type_air) {
+            swap_with = 3;
+        } else {
+            swap_with = rng.r < 0.5 ? 1 : 4;
+            if (get_cell_type(center, swap_with) != type_air)
+                swap_with = 0;
+        }
+        if (id == swap_with) {
+            cell.rgb = center_cell.rgb;
+        } else if (id == 0) {
+            ivec2 sp = center + ew_id_to_xy(swap_with);
+            cell.rgb = texelFetch(cells, sp, 0).rgb;
+        }
+        break;
+
+    case type_worm:
+        // based on swapworm https://github.com/walpolea/MFM-JS
+
+        // data: {3b count}, {3b angle}
+        // count 0 is head, turn into air after 7
+
+        uint center_count = get_bits(center_cell.g, 3, 21);
+        int angle = int(get_bits(center_cell.g, 3, 18));
+        ivec2 dir = dir45[angle];
+        // might change direction
+        if (rng.r < 0.05) {
+            angle = (angle + int(rng.b * 3.0) - 1) & 7;
+            dir = dir45[angle];
+            center_cell.g = set_bits(
+                center_cell.g, 3, 18, uint(angle)
+            );
+        }
+        // if center is head
+        if (center_count == 0u) {
+            // if direction free, move head & make center a body cell
+            ivec2 move_to = center + dir * int(
+                get_cell_type(center + dir) == type_air
+            );
+            if (p == move_to) {
+                // make this a worm head
+                cell.rgb = center_cell.rgb;
+            } else if (id == 0 && move_to != center) {
+                // make this a body (count > 0)
+                cell.g = set_bits(cell.g, 3, 21, 1u);
+                // start closer to body color
+                ivec4 c = ivec4(209, 0, 108, 255);
+                c.rgb += ivec3(urng % 80u) - 40;
+                c = clamp(c, 0, 255);
+                cell.r = set_cell_color(uvec4(c));
+            }
+        } else if (id == 0) {
+            // increment count for body
+            center_count += 1u;
+            cell.g = set_bits(cell.g, 3, 21, center_count);
+        }
+        // die
+        if (id == 0 && center_count > 7u) {
+            cell.g = set_bits(cell.g, 8, 24, type_air);
+            // start closer to air color
+            uint a = cell.r & 0xffu;
+            cell.r = set_bits(cell.r, 8, 0, a / 4u);
+        }
+        // todo: worm variants (contiguous, fixed size, vary speed)
+        break;
+    }
+
+    // set target color
+
+    // note: cell can be modified before here,
+    // avoid resampling from cells (like with get_cell_type)
+    uint cell_type = get_bits(cell.g, 8, 24);
+    ivec4 target_color = ivec4(0);
+
+    switch (cell_type) {
+    case type_pink_sand:
+        target_color = ivec4(255, 129, 193, 255);
+        break;
+    case type_worm:
+        target_color = (
+            get_bits(cell.g, 3, 21) == 0u
+            ? ivec4(216, 239, 254, 255) : ivec4(209, 0, 108, 255)
+        );
+        break;
+    }
+
+    // move towards target color, keep some variation (unless solid)
+    vec4 color = get_cell_color(cell.r);
+    vec4 tcolor = vec4(target_color);
+    if (solid_colors) {
+        color = tcolor;
+    } else {
+        color = distance(color, tcolor) < 30.0 ? color : mix(
+            color, tcolor, rng.r * 0.1 * round(rng.g * 0.502)
+        );
+    }
+    cell.r = set_cell_color(uvec4(color));
+
+    // convert random type to an implemented one
+    // avoid none, bias towards air
+    if (cell_type > type_worm || cell_type == type_none) {
+        uint new_type = (
+            rng.r < 0.5 ? type_air : urng.g % type_worm + 1u
+        );
+        cell.g = set_bits(cell.g, 8, 24, new_type);
+    }
+}
+</script>
+
+
+<script type="x-shader/x-fragment" id="frag_interact">
+#version 300 es
+precision highp float;
+precision highp int;
+precision highp usampler2D;
+
+out uvec4 cell;
+
+uniform usampler2D cells;
+uniform int time_step;
+uniform vec2 mouse;
+uniform float brush_size;
+uniform bool erase;
+
+/*<snip_math>*/
+
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    cell = texelFetch(cells, p, 0);
+
+    vec2 size = vec2(textureSize(cells, 0));
+    vec2 uv = vec2(p) / size;
+
+    for (int i = -1; i <= 1; ++i) {
+        for (int j = -1; j <= 1; ++j) {
+            vec2 uv_tile = uv + vec2(i, j);
+            if (distance(uv_tile, mouse) < brush_size) {
+                if (erase) {
+                    uint cell_type = (cell.g & 0xff000000u) >> 24;
+                    if (cell_type != 1u) {
+                        cell.g = set_bits(cell.g, 8, 24, 1u);
+                        // start closer to air color
+                        float a = float(cell.r & 0xffu);
+                        cell.r = set_bits(cell.r, 8, 0, uint(a * 0.8));
+                    }
+                } else {
+                    cell.rgb = uhash(ivec3(p, time_step)).rgb;
+                }
+            }
+        }
+    }
+}
+</script>
+
+
+<script type="x-shader/x-fragment" id="frag_draw">
+#version 300 es
+precision highp float;
+precision highp int;
+precision highp usampler2D;
+
+in vec2 uv;
+out vec4 color;
+
+uniform usampler2D cells;
+uniform sampler2D font;
+
+uniform vec2 screen_size;
+uniform float zoom_scale;
+uniform vec2 offset;
+uniform int time_step;
+uniform float time_sec;
+uniform bool show_ew;
+
+/*<snip_ew_draw>*/
+
+vec2 get_cam_uv() {
+    vec2 ss = screen_size;
+    vec2 aspect_scale = ss / min(ss.x, ss.y);
+    return 0.5 + (uv - 0.5) * aspect_scale / zoom_scale + offset;
+}
+
+void main() {
+    vec2 cam_uv = get_cam_uv();
+    vec2 cs = vec2(textureSize(cells, 0));
+    uvec4 cell = texture(cells, mod(cam_uv, 1.0));
+
+    color = vec4(uvec4(
+        get_bits(cell.r, 8, 24),
+        get_bits(cell.r, 8, 16),
+        get_bits(cell.r, 8, 8),
+        get_bits(cell.r, 8, 0)
+    )) / 255.0;
+
+    // event windows
+    vec4 ew_color = vec4(0.0);
+    if (show_ew) {
+        ew_color = get_ew_color(mod(cam_uv, 1.0) * cs);
+        color.rgb = mix(color.rgb, ew_color.rgb, ew_color.a * 0.5);
+        color.a = max(color.a, ew_color.a);
+    }
+
+    // lower contrast in wrapped cells
+    if (
+        min(cam_uv.x, cam_uv.y) < 0.0
+        || max(cam_uv.x, cam_uv.y) > 1.0
+    ) {
+        float desat = 0.3 + 0.2 * hash(
+            ivec3(floor_div(cam_uv, 1.0), 0)
+        ).r;
+        float d = distance(cam_uv, vec2(0.5));
+        float ping = sin(d * 10.0 - time_sec * 5.0);
+        ping = 0.9 + 0.1 * ping * min(max(d - 2.0, 0.0), 1.0);
+        desat *= ping;
+        color.rgb = mix(color.rgb, vec3(0.5), desat);
+    }
+
+    // text
+    vec2 cell_uv = mod(cam_uv * cs, 1.0);
+    float text_visibility = smoothstep(
+        3.0, 5.0, log2(zoom_scale)
+    ) * (1.0 - ew_color.a);
+    if (text_visibility > 0.001) {
+        vec4 text_color = vec4(mod(color.rgb + 0.6, 1.0), 0.0);
+
+        // element type
+        // label
+        text_color.a = max(text_color.a, draw_str(
+            elem_str, elem_str_len, vec2(0.5, 0.15), 0.18, cell_uv
+        ));
+        // number
+        uint type = get_cell_type(ivec2(mod(cam_uv, 1.0) * cs), 0);
+        text_color.a = max(text_color.a, draw_number(
+            int(type), vec2(0.5), 0.5, cell_uv
+        ));
+
+        // average event count per second
+        // label
+        float height = 0.18;
+        float char_width = height * 0.6;
+        text_color.a = max(text_color.a, draw_str(
+            aer_str, aer_str_len, vec2(
+                0.5 - float(aer_str_len - 1) * char_width * 0.5,
+                0.85
+            ), height, cell_uv
+        ));
+        // number
+        int aer = int(get_bits(cell.a, 14, 15));
+        vec2 aer_num_center = left_align(
+            aer, vec2(0.5 + char_width * 0.5, 0.85), height
+        );
+        text_color.a = max(text_color.a, draw_number(
+            aer, aer_num_center, height, cell_uv
+        ));
+
+        // apply text color
+        text_color.a *= text_visibility;
+        float new_alpha = mix(color.a, 1.0, text_color.a);
+        color.rgb = mix(
+            color.rgb * color.a, text_color.rgb, text_color.a
+        ) / new_alpha;
+        color.a = new_alpha;
+    }
+
+    // canavs assumes output has premultiplied alpha by default
+    color.rgb *= color.a;
+}
+</script>
+
+
+<script type="x-shader/x-fragment" id="snip_math">
+uvec3 uhash(ivec3 ix) {
+    // source: https://www.shadertoy.com/view/XlXcW4
+    uvec3 x = uvec3(ix);
+    const uint k = 1103515245u;
+    x = ((x >> 8u)^x.yzx) * k;
+    x = ((x >> 8u)^x.yzx) * k;
+    x = ((x >> 8u)^x.yzx) * k;
+    return x;
+}
+vec3 hash(ivec3 ix) {
+    return vec3(uhash(ix)) * (1.0 / float(~0u));
+}
+
+int sum(ivec2 x) {
+    return x.x + x.y;
+}
+int sum(ivec3 x) {
+    return x.x + x.y + x.z;
+}
+
+int floor_div(int x, int k) {
+    return x < 0 ? -((abs(x) - 1) / k) - 1 : x / k;
+}
+ivec2 floor_div(ivec2 x, int k) {
+    return ivec2(floor_div(x.x, k), floor_div(x.y, k));
+}
+ivec2 floor_div(vec2 x, float k) {
+    return ivec2(floor(x / k));
+}
+
+int ceil_div(int x, int k) {
+    return x / k + int(x % k != 0 && (x < 0) == (k < 0));
+}
+
+ivec2 modi(ivec2 x, int k) {
+    return x - floor_div(x, k) * k;
+}
+
+uint get_bits(uint bits, int size, int skip_size) {
+    // get {size} bits, skipping rightmost {skip_size} bits
+    uint mask = ((1u << size) - 1u) << skip_size;
+    return (bits & mask) >> skip_size;
+}
+
+uint set_bits(uint bits, int size, int skip_size, uint new_bits) {
+    // note: saturates {new_bits} to {size} bits
+    uint mask = (1u << size) - 1u;
+    new_bits = min(new_bits, mask);
+    new_bits <<= skip_size;
+    mask <<= skip_size;
+    return (bits & ~mask) | new_bits;
+}
+
+vec4 get_cell_color(uint cell_r) {
+    return vec4(uvec4(
+        (cell_r & 0xff000000u) >> 24,
+        (cell_r & 0xff0000u) >> 16,
+        (cell_r & 0xff00u) >> 8,
+        (cell_r & 0xffu)
+    ));
+}
+
+uint set_cell_color(uvec4 color) {
+    return (
+        (color.r << 24) + (color.g << 16)
+        + (color.b << 8) + color.a
+    );
+}
+</script>
+
+
+<script type="x-shader/x-fragment" id="snip_ew_sim">
+/*<snip_math>*/
+
+ivec4 get_ew_coords(ivec2 p) {
+    // returns: (x, y, distance, id)
+
+    // related to poisson disk sampling and blue noise
+
+    // cells have probability x of being candidate ew centers
+    // if any two would overlap (distance <= 8), both are invalid
+    // 145 cells in a manhattan distance 8 window
+    // P(ew center) = x * (1 - x)^144
+    // max is 0.0025 at x = 1 / 145 = 0.0069
+
+    // approximate with 12x12 cell tiles proposing 0 or 1 candidates
+    // can look at neighboring 8 tiles to determine validity
+    // (of md4 event windows that overlap with this cell's tile)
+    // P(tile has candidate) = 1 - (1 - x)^144 = 0.6308
+    // (optimal rate would be a bit higher with 0 or 1 approximation)
+
+    // todo: test different proposal rates,
+    // try 2nd proposal pass to increase density
+
+    // get (x, y, proposal rng) for tile and neighbors
+    ivec3 o = ivec3(-1, 0, 1);
+    ivec2 tile = floor_div(p, 12);
+    vec3 r00 = hash(ivec3(tile + o.xx, time_step));
+    vec3 r01 = hash(ivec3(tile + o.xy, time_step));
+    vec3 r02 = hash(ivec3(tile + o.xz, time_step));
+    vec3 r10 = hash(ivec3(tile + o.yx, time_step));
+    vec3 r11 = hash(ivec3(tile + o.yy, time_step));
+    vec3 r12 = hash(ivec3(tile + o.yz, time_step));
+    vec3 r20 = hash(ivec3(tile + o.zx, time_step));
+    vec3 r21 = hash(ivec3(tile + o.zy, time_step));
+    vec3 r22 = hash(ivec3(tile + o.zz, time_step));
+
+    // convert x, y to center tile relative cell coords
+    // or "throw it away" if it "wasnt actually proposed"
+    ivec2 invalid = o.zz * 99;
+    ivec2 p00 = (
+        r00.z < 0.6308 ? o.xx * 12 + ivec2(r00.xy * 12.0) : invalid
+    );
+    ivec2 p01 = (
+        r01.z < 0.6308 ? o.xy * 12 + ivec2(r01.xy * 12.0) : invalid
+    );
+    ivec2 p02 = (
+        r02.z < 0.6308 ? o.xz * 12 + ivec2(r02.xy * 12.0) : invalid
+    );
+    ivec2 p10 = (
+        r10.z < 0.6308 ? o.yx * 12 + ivec2(r10.xy * 12.0) : invalid
+    );
+    ivec2 p11 = (
+        r11.z < 0.6308 ? o.yy * 12 + ivec2(r11.xy * 12.0) : invalid
+    );
+    ivec2 p12 = (
+        r12.z < 0.6308 ? o.yz * 12 + ivec2(r12.xy * 12.0) : invalid
+    );
+    ivec2 p20 = (
+        r20.z < 0.6308 ? o.zx * 12 + ivec2(r20.xy * 12.0) : invalid
+    );
+    ivec2 p21 = (
+        r21.z < 0.6308 ? o.zy * 12 + ivec2(r21.xy * 12.0) : invalid
+    );
+    ivec2 p22 = (
+        r22.z < 0.6308 ? o.zz * 12 + ivec2(r22.xy * 12.0) : invalid
+    );
+
+    // also throw away overlaps
+
+    bool sep_00_01 = sum(abs(p00 - p01)) > 8;
+    bool sep_00_10 = sum(abs(p00 - p10)) > 8;
+    bool sep_00_11 = sum(abs(p00 - p11)) > 8;
+
+    bool sep_01_02 = sum(abs(p01 - p02)) > 8;
+    bool sep_01_10 = sum(abs(p01 - p10)) > 8;
+    bool sep_01_11 = sum(abs(p01 - p11)) > 8;
+    bool sep_01_12 = sum(abs(p01 - p12)) > 8;
+
+    bool sep_02_11 = sum(abs(p02 - p11)) > 8;
+    bool sep_02_12 = sum(abs(p02 - p12)) > 8;
+
+    bool sep_10_11 = sum(abs(p10 - p11)) > 8;
+    bool sep_10_20 = sum(abs(p10 - p20)) > 8;
+    bool sep_10_21 = sum(abs(p10 - p21)) > 8;
+
+    bool sep_11_12 = sum(abs(p11 - p12)) > 8;
+    bool sep_11_20 = sum(abs(p11 - p20)) > 8;
+    bool sep_11_21 = sum(abs(p11 - p21)) > 8;
+    bool sep_11_22 = sum(abs(p11 - p22)) > 8;
+
+    bool sep_12_21 = sum(abs(p12 - p21)) > 8;
+    bool sep_12_22 = sum(abs(p12 - p22)) > 8;
+
+    bool sep_20_21 = sum(abs(p20 - p21)) > 8;
+
+    bool sep_21_22 = sum(abs(p21 - p22)) > 8;
+
+    p00 = sep_00_01 && sep_00_10 && sep_00_11 ? p00 : invalid;
+    p01 = (
+        sep_00_01 && sep_01_02 && sep_01_10 && sep_01_11 && sep_01_12
+    ) ? p01 : invalid;
+    p02 = sep_01_02 && sep_02_11 && sep_02_12 ? p02 : invalid;
+    p10 = (
+        sep_00_10 && sep_01_10 && sep_10_11 && sep_10_20 && sep_10_21
+    ) ? p10 : invalid;
+    p11 = (
+        sep_00_11 && sep_01_11 && sep_02_11 && sep_10_11
+        && sep_11_12 && sep_11_20 && sep_11_21 && sep_11_22
+    ) ? p11 : invalid;
+    p12 = (
+        sep_01_12 && sep_02_12 && sep_11_12 && sep_12_21 && sep_12_22
+    ) ? p12 : invalid;
+    p20 = sep_10_20 && sep_11_20 && sep_20_21 ? p20 : invalid;
+    p21 = (
+        sep_10_21 && sep_11_21 && sep_12_21 && sep_20_21 && sep_21_22
+    ) ? p21 : invalid;
+    p22 = sep_11_22 && sep_12_22 && sep_21_22 ? p22 : invalid;
+
+    // get cell position relative to closest event window
+
+    ivec2 p_rel_tile = modi(p, 12);
+
+    // position relative to each possible window
+    ivec3 pr_00 = ivec3(p_rel_tile - p00, 0);
+    ivec3 pr_01 = ivec3(p_rel_tile - p01, 0);
+    ivec3 pr_02 = ivec3(p_rel_tile - p02, 0);
+    ivec3 pr_10 = ivec3(p_rel_tile - p10, 0);
+    ivec3 pr_11 = ivec3(p_rel_tile - p11, 0);
+    ivec3 pr_12 = ivec3(p_rel_tile - p12, 0);
+    ivec3 pr_20 = ivec3(p_rel_tile - p20, 0);
+    ivec3 pr_21 = ivec3(p_rel_tile - p21, 0);
+    ivec3 pr_22 = ivec3(p_rel_tile - p22, 0);
+
+    // add manhattan distances
+    pr_00.z = sum(abs(pr_00.xy));
+    pr_01.z = sum(abs(pr_01.xy));
+    pr_02.z = sum(abs(pr_02.xy));
+    pr_10.z = sum(abs(pr_10.xy));
+    pr_11.z = sum(abs(pr_11.xy));
+    pr_12.z = sum(abs(pr_12.xy));
+    pr_20.z = sum(abs(pr_20.xy));
+    pr_21.z = sum(abs(pr_21.xy));
+    pr_22.z = sum(abs(pr_22.xy));
+
+    // reduce to closest
+
+    ivec3 pr_0_1 = pr_00.z < pr_01.z ? pr_00 : pr_01;
+    ivec3 pr_2_3 = pr_02.z < pr_10.z ? pr_02 : pr_10;
+    ivec3 pr_4_5 = pr_11.z < pr_12.z ? pr_11 : pr_12;
+    ivec3 pr_6_7 = pr_20.z < pr_21.z ? pr_20 : pr_21;
+
+    ivec3 pr_0_3 = pr_0_1.z < pr_2_3.z ? pr_0_1 : pr_2_3;
+    ivec3 pr_4_7 = pr_4_5.z < pr_6_7.z ? pr_4_5 : pr_6_7;
+
+    ivec3 pr_0_7 = pr_0_3.z < pr_4_7.z ? pr_0_3 : pr_4_7;
+    ivec4 p_rel_ew = ivec4(pr_0_7.z < pr_22.z ? pr_0_7 : pr_22, 0);
+
+    // add id
+
+    ivec3 offsets = ivec3(0);
+    int x = p_rel_ew.x;
+    int y = p_rel_ew.y;
+    int md = p_rel_ew.z;
+    int mag = max(abs(x), abs(y));
+
+    offsets.x = 2 * md * (md - 1) + int(md > 0);
+    if (mag > 1) {
+        int min_mag = ceil_div(md, 2);
+        int phase = ((md + 1) % 2) * 4;
+        offsets.y = max((mag - min_mag) * 8 - phase, 0);
+    }
+    offsets.z = md == 0 ? 0 : (
+        md == mag ? (x + md) / md + int(x + y > 0)
+        : x < 0 ? 2 * int(md + x > -x) + int(y > 0)
+        : abs(x) == abs(y) ? 2 + int(y > 0)
+        : 4 + 2 * int(md - x < x) + int(y > 0)
+    );
+    p_rel_ew.w = sum(offsets);
+
+    // invalidate if center is past grid edge
+    ivec2 c = p - p_rel_ew.xy;
+    ivec2 res = textureSize(cells, 0);
+    if (min(c.x, c.y) < 0 || c.x >= res.x || c.y >= res.y)
+        p_rel_ew.z = 99;
+
+    return p_rel_ew;
+}
+
+ivec2 ew_id_to_xy(int id) {
+    switch (id) {
+        case 0: return ivec2(0, 0);    case 1: return ivec2(-1, 0);
+        case 2: return ivec2(0, -1);   case 3: return ivec2(0, 1);
+        case 4: return ivec2(1, 0);    case 5: return ivec2(-1, -1);
+        case 6: return ivec2(-1, 1);   case 7: return ivec2(1, -1);
+        case 8: return ivec2(1, 1);    case 9: return ivec2(-2, 0);
+        case 10: return ivec2(0, -2);  case 11: return ivec2(0, 2);
+        case 12: return ivec2(2, 0);   case 13: return ivec2(-2, -1);
+        case 14: return ivec2(-2, 1);  case 15: return ivec2(-1, -2);
+        case 16: return ivec2(-1, 2);  case 17: return ivec2(1, -2);
+        case 18: return ivec2(1, 2);   case 19: return ivec2(2, -1);
+        case 20: return ivec2(2, 1);   case 21: return ivec2(-3, 0);
+        case 22: return ivec2(0, -3);  case 23: return ivec2(0, 3);
+        case 24: return ivec2(3, 0);   case 25: return ivec2(-2, -2);
+        case 26: return ivec2(-2, 2);  case 27: return ivec2(2, -2);
+        case 28: return ivec2(2, 2);   case 29: return ivec2(-3, -1);
+        case 30: return ivec2(-3, 1);  case 31: return ivec2(-1, -3);
+        case 32: return ivec2(-1, 3);  case 33: return ivec2(1, -3);
+        case 34: return ivec2(1, 3);   case 35: return ivec2(3, -1);
+        case 36: return ivec2(3, 1);   case 37: return ivec2(-4, 0);
+        case 38: return ivec2(0, -4);  case 39: return ivec2(0, 4);
+        case 40: return ivec2(4, 0);
+    }
+}
+
+const ivec2[] dir45 = ivec2[](
+    ivec2(0, -1), ivec2(1, -1), ivec2(1, 0), ivec2(1, 1),
+    ivec2(0, 1), ivec2(-1, 1), ivec2(-1, 0), ivec2(-1, -1)
+);
+
+uint get_cell_type(ivec2 p) {
+    ivec2 res = textureSize(cells, 0);
+    if (min(p.x, p.y) < 0 || p.x >= res.x || p.y >= res.y) return 0u;
+    return get_bits(texelFetch(cells, p, 0).g, 8, 24);
+}
+uint get_cell_type(ivec2 center, int id) {
+    ivec2 p = center + ew_id_to_xy(id);
+    return get_cell_type(p);
+}
+</script>
+
+
+<script type="x-shader/x-fragment" id="snip_ew_draw">
+/*<snip_ew_sim>*/
+
+float draw_char(int id, vec4 box, vec2 p) {
+    id -= 32;
+    vec2 box_uv = clamp((p - box.xy) / box.zw, 0.0, 1.0);
+    vec2 offset = vec2(ivec2(id % 10, id / 10));
+    vec2 char_uv = (box_uv + offset) / 10.0;
+    return texture(font, char_uv).a;
+}
+
+const int[8] aer_str = int[](65, 69, 82, 58, 0, 0, 0, 0);
+const int aer_str_len = 4;
+const int[8] elem_str = int[](101, 108, 101, 109, 0, 0, 0, 0);
+const int elem_str_len = 4;
+
+float draw_str(
+    int[8] str, int len, vec2 center, float height, vec2 p
+) {
+    if (abs(p.y - center.y) * 2.0 > height) { return 0.0; }
+
+    float char_width = height * 0.6;
+    float width = float(len) * char_width;
+    if (abs(p.x - center.x) * 2.0 > width) { return 0.0; }
+
+    vec2 top_left = center - vec2(width * 0.5, 0.5 * height);
+    int idx = int((p.x - top_left.x) / char_width);
+    vec4 box = vec4(
+        top_left.x + char_width * float(idx),
+        top_left.y,
+        vec2(char_width, height)
+    );
+    return draw_char(str[idx], box, p);
+}
+
+float draw_number(int val, vec2 center, float height, vec2 p) {
+    if (abs(p.y - center.y) * 2.0 > height) { return 0.0; }
+
+    // todo: minus sign
+    float digits = max(1.0, floor(
+        log2(float(val)) / log2(10.0) + 1.0
+    ));
+    float char_width = height * 0.6;
+    float width = digits * char_width;
+    if (abs(p.x - center.x) * 2.0 > width) { return 0.0; }
+
+    vec2 top_right = center + vec2(width * 0.5, -0.5 * height);
+    float digit = floor((top_right.x - p.x) / char_width);
+    vec4 box = vec4(
+        top_right.x - char_width * (digit + 1.0),
+        top_right.y,
+        vec2(char_width, height)
+    );
+    val /= int(pow(10.0, digit));
+    return draw_char((val % 10) + 48, box, p);
+}
+
+vec2 left_align(int val, vec2 left_mid, float height) {
+    // convert (left, mid) to (mid, mid) for draw_number
+    // todo: minus sign
+    float digits = max(1.0, floor(
+        log2(float(val)) / log2(10.0) + 1.0
+    ));
+    float char_width = height * 0.6;
+    float width = digits * char_width;
+    return left_mid + vec2(width * 0.5, 0.0);
+}
+
+vec4 ew_colors[] = vec4[](
+    vec4(250.0, 250.0, 242.0, 255.0) / 255.0,
+    vec4(247.0, 253.0, 245.0, 255.0) / 255.0,
+    vec4(235.0, 254.0, 253.0, 255.0) / 255.0,
+    vec4(217.0, 241.0, 253.0, 255.0) / 255.0,
+    vec4(250.0, 217.0, 217.0, 255.0) / 255.0
+);
+
+vec4 get_ew_color(vec2 p) {
+    vec4 color = vec4(0.0);
+    ivec4 ew_coords = get_ew_coords(ivec2(floor(p)));
+    int d = ew_coords.z;
+    int id = ew_coords.w;
+    if (d <= 4) {
+        color = ew_colors[d];
+        float num_visibility = smoothstep(
+            3.0, 5.0, log2(zoom_scale)
+        );
+        vec2 cell_uv = mod(p, 1.0);
+        float num_alpha = draw_number(id, vec2(0.5), 0.3, cell_uv);
+        color = mix(
+            color,
+            vec4(vec3(0.0), 1.0),
+            num_alpha * num_visibility
+        );
+    }
+    return color;
+}
+</script>
+
+
+<script id="webgl_loop">
+function fix_size() {
+    for (const [_, v] of Object.entries(canvases)) {
+        if (v.width !== innerWidth || v.height !== innerHeight) {
+            v.width = innerWidth
+            v.height = innerHeight
+        }
+    }
+    gl.viewport(0, 0, innerWidth, innerHeight)
+}
+
+function sim_step() {
+    gl.useProgram(sim_program)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
+    gl.framebufferTexture2D(
+        gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D,
+        grid_cells[1], 0,
+    )
+
+    const u1i = (name, x) => gl.uniform1i(
+        gl.getUniformLocation(sim_program, name), x)
+    const u1f = (name, x) => gl.uniform1f(
+        gl.getUniformLocation(sim_program, name), x)
+
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, grid_cells[0])
+    u1i("cells", 0)
+
+    u1i("time_step", timing.step)
+    u1f("time_sec", timing.sec)
+    u1i("solid_colors", solid_colors)
+
+    gl.enableVertexAttribArray(0)
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+    grid_cells = [grid_cells[1], grid_cells[0]]
+    timing.step++
+}
+
+function interact() {
+    // get mouse cam coords
+    const short_edge = min(innerWidth, innerHeight)
+    const scale = short_edge * zoom.scale
+    const mx = mod(
+        0.5 + (mouse.x - innerWidth / 2) / scale - pan.x,
+        1,
+    )
+    const my = mod(
+        0.5 + (mouse.y - innerHeight / 2) / scale - pan.y,
+        1,
+    )
+
+    // bloatware for the draw call
+    gl.useProgram(interact_program)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
+    gl.framebufferTexture2D(
+        gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D,
+        grid_cells[1], 0,
+    )
+
+    const u1i = (name, x) => gl.uniform1i(
+        gl.getUniformLocation(interact_program, name), x)
+
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, grid_cells[0])
+    u1i("cells", 0)
+
+    u1i("time_step", timing.step)
+    gl.uniform2f(
+        gl.getUniformLocation(interact_program, "mouse"),
+        mx, my,
+    )
+    gl.uniform1f(
+        gl.getUniformLocation(interact_program, "brush_size"),
+        brush.get_size(),
+    )
+    u1i("erase", brush.erase)
+
+    gl.enableVertexAttribArray(0)
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+    grid_cells = [grid_cells[1], grid_cells[0]]
+}
+
+function draw() {
+    gl.useProgram(draw_program)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+
+    const u1i = (name, x) => gl.uniform1i(
+        gl.getUniformLocation(draw_program, name), x)
+    const u1f = (name, x) => gl.uniform1f(
+        gl.getUniformLocation(draw_program, name), x)
+    const u2f = (name, x, y) => gl.uniform2f(
+        gl.getUniformLocation(draw_program, name), x, y)
+
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, grid_cells[0])
+    gl.activeTexture(gl.TEXTURE1)
+    gl.bindTexture(gl.TEXTURE_2D, font_tex)
+    u1i("cells", 0)
+    u1i("font", 1)
+
+    u2f("screen_size", canvases.gl.width, canvases.gl.height)
+    u1f("zoom_scale", zoom.scale)
+    u2f("offset", -pan.x, -pan.y)
+    u1i("time_step", timing.step)
+    u1f("time_sec", timing.sec)
+    u1i("show_ew", show_ew)
+
+    gl.enableVertexAttribArray(0)
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+}
+</script>
+
+
+<script id="webgl_setup">
+const canvases = {
+    gl: document.getElementById("gl_canvas"),
+    ctx: document.getElementById("2d_canvas")
+}
+for (const [_, v] of Object.entries(canvases)) {
+    v.width = innerWidth
+    v.height = innerHeight
+}
+const gl = canvases.gl.getContext("webgl2")
+const ctx = canvases.ctx.getContext("2d")
+
+const vertices = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1])
+const buffer = gl.createBuffer()
+const fb = gl.createFramebuffer()
+
+gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW)
+
+let grid_cells = [new_cells(grid_size), new_cells(grid_size)]
+let font_tex
+let sim_program, interact_program, draw_program
+
+function load_webgl() {
+    // load shaders
+
+    const source = id => document.getElementById(id).innerText.trim()
+
+    const snip_math = source("snip_math")
+    const snip_ew_sim = source("snip_ew_sim").replace(
+        "/*<snip_math>*/", snip_math
+    )
+    const snip_ew_draw = source("snip_ew_draw").replace(
+        "/*<snip_ew_sim>*/", snip_ew_sim
+    )
+    const snips = { snip_math, snip_ew_sim, snip_ew_draw }
+
+    function shimmed(id) {
+        let s = source(id)
+        for (const [k, v] of Object.entries(snips)) {
+            s = s.replace(`/*<${k}>*/`, v)
+        }
+        return s
+    }
+
+    const vert_source = source("vert")
+    sim_program = create_program(
+        vert_source, shimmed("frag_sim")
+    )
+    interact_program = create_program(
+        vert_source, shimmed("frag_interact")
+    )
+    draw_program = create_program(
+        vert_source, shimmed("frag_draw")
+    )
+
+    // make font texture
+    const tc = document.createElement("canvas")
+    tc.width = 480
+    tc.height = 800
+    const ctx = tc.getContext("2d")
+    ctx.font = "80px Courier New"
+    ctx.fillStyle = "white"
+    ctx.textBaseline = "top"
+    // 10x10 block of chars 32-126
+    for (const [i, row] of [
+        " !\"#$%&\'()", "*+,-./0123", "456789:;<=", ">?@ABCDEFG",
+        "HIJKLMNOPQ", "RSTUVWXYZ[", "\\]^_`abcde", "fghijklmno",
+        "pqrstuvwxy", "z{|}~",
+    ].entries()) {
+        ctx.fillText(row, 0, 80 * i)
+    }
+    font_tex = gl.createTexture()
+    gl.bindTexture(gl.TEXTURE_2D, font_tex)
+    gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, tc,
+    )
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+
+    // AER print loop
+    console.log("(wait for AER to stabilize from random init)")
+    setInterval(() => {
+        read_cells().then(c => {
+            const weight = 1 / grid_size**2
+            let aer = 0
+            for (let i = 3; i < grid_size**2 * 4; i += 4) {
+                // (2**14 - 1) << 15 = 0x1fff8000
+                const avg_events = (c[i] & 0x1fff8000) >> 15
+                aer += avg_events * weight
+            }
+            console.log(`AER: ${aer.toFixed(2)}`)
+        })
+    }, 3000)
+}
+
+async function read_cells() {
+    const framebuf = gl.createFramebuffer()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuf)
+    gl.framebufferTexture2D(
+        gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D,
+        grid_cells[0], 0,
+    )
+
+    const pixels = new Uint32Array(grid_size**2 * 4)
+    await new Promise(resolve => {
+        gl.readPixels(
+            0, 0, grid_size, grid_size,
+            gl.RGBA_INTEGER, gl.UNSIGNED_INT, pixels,
+        )
+        gl.finish()
+        resolve()
+    })
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.deleteFramebuffer(framebuf)
+    return pixels
+}
+
+function compile_shader(source, type) {
+    const shader = gl.createShader(type)
+    gl.shaderSource(shader, source)
+    gl.compileShader(shader)
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS))
+        console.error(gl.getShaderInfoLog(shader))
+
+    return shader
+}
+
+function create_program(vert_source, frag_source) {
+    const program = gl.createProgram()
+    gl.attachShader(
+        program, compile_shader(vert_source, gl.VERTEX_SHADER)
+    )
+    gl.attachShader(
+        program, compile_shader(frag_source, gl.FRAGMENT_SHADER)
+    )
+    gl.linkProgram(program)
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS))
+        console.error(gl.getProgramInfoLog(program))
+
+    return program
+}
+
+function new_cells(size) {
+    const tex = gl.createTexture()
+    init_cells(tex, size)
+    gl.texParameteri(
+        gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST,
+    )
+    gl.texParameteri(
+        gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST,
+    )
+
+    return tex
+}
+
+function init_cells(tex, size) {
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    const pixels = new Uint32Array(size * size * 4).map(
+        () => rand() * 2**32
+    )
+    gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.RGBA32UI, size, size, 0,
+        gl.RGBA_INTEGER, gl.UNSIGNED_INT, pixels,
+    )
+}
+</script>
+
+</body>
+</html>
